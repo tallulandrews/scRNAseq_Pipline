@@ -1,0 +1,514 @@
+---
+output: html_document
+---
+
+```{r exprs-qc0, echo=FALSE}
+library(knitr)
+opts_chunk$set(cache = TRUE, out.width='100%', fig.align = 'center')
+```
+
+
+# Basic Quality Control (QC) and Visual Exploration of scRNA-seq Datasets
+
+## Dataset Contruction and QC
+
+### Introduction
+
+Once we have identified droplets containing a cell from the empty droplets, we do another layer of quality checking and filtering to eliminate cells that are dead or damaged. Damaged cells typically have high mitochondrial reads, while dead cells have low total genes detected.
+
+:::note
+If you use a different expression quantification method than cellranger (e.g. STARsolo, Alevin) then you may want to additionally consider the proportion of your UMI counts that derive from protein coding genes rather than pseudogenes or lncRNAs as high proportions of non-protein coding expression may be associated with high sequence error rates.
+:::
+
+However, since different types of cells can have more or less RNA within them, more or less mitochondria inside them, and the depth of sequencing can vary between experiments, there is no universal threshold for how much is "enough" or how much is "too much".
+
+*Note: Single-nucleus RNAseq generally captures 10x less mitochondrial RNA than single-cell.*
+
+Instead, we look at the distribution of the appropriate metric and create our threshold based on that. Generally we assume the average normalized expression over a set of genes should be approximately normally distributed, as would the total number of genes detected per cell. Using this assumption we look for outliers / "heavy tails" and use the threshold to exclude them.
+
+### Example Data (Liver)
+
+We will continue working with the liver dataset we used to run EmptyDrops.
+```{r exprs-qc1, message=FALSE, warning=FALSE}
+library(SingleCellExperiment)
+library(DropletUtils)
+sce<-DropletUtils::read10xCounts("../ExampleData/Liver5/filtered_feature_bc_matrix/")
+```
+
+## QC with `scater` package
+
+We'll start by using `scater`, which contains many useful functions for calculating standard QC metrics on our data. However, one key QC metric is the proportion of mitochondrial genes in each cell. The problem with this metric is that there is no standard naming convention for mitochondrial genes across all organisms, so we have to tell the function which genes are mitochondrial.
+
+For Human data, the gene symbol of mitochondrial genes (i.e. genes on the mitochondrial genome) all start with "MT-". We can use the `grepl` function to find out whether each gene name ("string") matches or doesn't match this pattern.
+
+```{r}
+library(scater)
+is.mt <- grepl("^MT-", rowData(sce)$Symbol)
+sum(is.mt)
+```
+Here we can see that we've found 13 genes from the mitochondrial genome, as expected. Now let's calculate the QC metrics and add them to our SCE:
+```{r}
+cellQC <- perCellQCMetrics(sce,subsets=list(Mito=is.mt))
+geneQC <- perFeatureQCMetrics(sce)
+
+head(cellQC)
+head(geneQC)
+
+colData(sce) <- cbind(colData(sce), cellQC)
+rowData(sce) <- cbind(rowData(sce), geneQC)
+```
+Ok first thing we notice is that we have a lot of genes in our object that aren't expressed at all. Typically only genes with expression in at least 1% of our cells are going to be useful for downstream analysis. However, if you have a really large dataset or expect there to be some really rare cell-types you might want to keep genes with even lower expression levels.
+
+```{r}
+keep.genes <- geneQC$detected > 0.01
+sum(keep.genes)
+sce <- sce[keep.genes,]
+```
+27,083 genes is going to include pretty much all the protein coding genes so this looks pretty good. Usually we will have between 10,000-30,000 genes detected depending on our experiment.
+
+
+Now let's try to figure out good thresholds for our cells. To do this we need to look at the distribution of our QC metrics:
+
+
+First consider the total detected genes - this is the best metric for identifying dead cells.
+
+```{r exprs-qc8}
+hist(
+  sce$detected,
+  breaks = 100
+)
+```
+
+Here you can see there is a roughly normal distribution around ~1000 genes / cell, and a spike close to 0. We want to get rid of that lower spike. After a little playing around we can find that a threshold fo 500 genes / cell seems like a good cut-off.
+
+
+```{r exprs-qc8}
+cell_filter_detect <- sce$detected < 500
+hist(
+  sce$detected,
+  breaks = 100
+)
+abline(v = 500, col = "red")
+```
+
+Next we look at %MT - this is the best metric for debris and damaged cells. Again we eye-ball the distribution to pick a good cut-off
+
+```{r exprs-qc8}
+cell_filter_MT <- sce$subsets_Mito_percent > 30
+hist(
+  sce$subsets_Mito_percent,
+  breaks = 100
+)
+abline(v = 30, col = "red")
+```
+:::note
+To reduce effects of tissue handling, we didn't wash our cells to remove debris prior to putting them onto the Chromium. As a result we have more damaged cells (high MT) than you will usually see in your datasets. Usually you can expect your MT threshold to be 5-10%
+:::
+
+Last, we can check how much overlap there is between the cells we chose to filter out:
+```{r}
+sum(cell_filter_detect)
+sum(cell_filter_MT)
+sum(cell_filter_detect & cell_filter_MT)
+sum(!(cell_filter_detect | cell_filter_MT))
+sce$discard <- (cell_filter_detect | cell_filter_MT)
+```
+Here you can see these two thresholds are identifying almost the same set of cells, and about 70% of our cells are going to be filtered out. Typically you would expect ~20% of your cells to be excluded, but we are using a very messy dataset to demonstrate how important QC can be.
+
+Plotting various coldata (cell-level medadata) assays against each other allows us to illustrate the dependencies between them. For example, cells with high mitochondrial content usually are considered dead or dying; these cells also usually have low overall UMI counts and number of detected genes. 
+
+```{r exprs-qc12}
+plotColData(sce, x="sum", y="subsets_Mito_percent", colour_by="discard")
+plotColData(sce, x="sum", y="detected", colour_by="discard")
+```
+
+Now we just need to apply our filters.
+```{r}
+sce_filtered <- sce[,!sce$discard]
+```
+
+Since we removed many cells, we better refilter genes too.
+
+```{r}
+geneQC <- perFeatureQCMetrics(sce_filtered)
+
+keep.genes <- geneQC$detected > 0.01
+sum(keep.genes)
+sce_filtered <- sce_filtered[keep.genes,]
+```
+
+***Exercise 1***
+Create a histogram and filter based on the total counts (`sum`). How similar or different is this from the histogram and threshold using number of detected genes?
+
+## QC with the `Seurat` package.
+
+Seurat has similar functions and visualizations to help us determine appropriate QC thresholds for our data. First let's turn our data into a Seurat object. We can reload in the raw data for a fresh object:
+
+
+```{r}
+library(Seurat)
+seur_obj <- CreateSeuratObject(Read10X("../ExampleData/Liver5/filtered_feature_bc_matrix/"))
+```
+
+Or we could convert our filtered SCE Object into a Seurat Object (or vice versa):
+
+```{r}
+sce_filtered <- logNormCounts(sce_filtered) # we need to normalize the SCE to do the conversion.
+seur_obj2 <- as.Seurat(sce_filtered)
+sce2 <- as.SingleCellExperiment(seur_obj)
+```
+Once again we need to specify how to identify mitochondrial genes to calculate their percentage in the data:
+
+```{r}
+seur_obj[["percent.mt"]] <- PercentageFeatureSet(seur_obj, "^MT-")
+```
+
+The `Seurat` package prefers to use Violin Plots to histograms. Violin plots combine a boxplot with a density distribution, and Seurat plots each datapoint as well to give the most complete information it can. However depending on the size of your dataset it can be difficult to make out the plot.
+```{r}
+VlnPlot(seur_obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+In general, these plots can be harder to use to to identify lower thresholds (like for nFeature and nCount) but work well for upper thresholds (percent.mt). It is debatable whether or not to exclude outliers with high total nCount/nFeature. It is thought these droplets may be more likely to contain doublets, but there isn't much evidence to back this up. Instead, using scatter plots showing the relationship between these metrics can be more helpful when doing QC with Seurat.
+
+```{r}
+plot1 <- FeatureScatter(seur_obj, feature1 = "nCount_RNA", feature2 = "percent.mt") + theme(legend.position = "none")
+plot2 <- FeatureScatter(seur_obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") + theme(legend.position = "none")
+plot1 + plot2 
+```
+Let's draw our thresholds on these plots as well, and colour the cells based on whether they pass our filters
+
+```{r}
+seur_obj@meta.data$pass.filter <- seur_obj@meta.data$percent.mt < 30 & seur_obj@meta.data$nFeature_RNA > 500
+plot_mt <- FeatureScatter(seur_obj, feature1 = "nCount_RNA", feature2 = "percent.mt", group.by="pass.filter") + theme(legend.position = "none") + geom_hline(yintercept=30)+ggtitle("")
+plot_nfeature <- FeatureScatter(seur_obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by="pass.filter") + geom_hline(yintercept = 500)+ggtitle("")
+plot_mt+plot_nfeature
+```
+Finally, we can subset our seurat object to apply our filters.
+```{r}
+seur_obj_filtered <- subset(seur_obj, subset = nFeature_RNA > 500 & percent.mt < 30)
+```
+
+***Exercise 2***
+
+Reduce the threshold on mitochondrial RNA to 20%. How many additional cells does this remove? Is the a better threshold for this dataset?
+
+***Exercise 3***
+
+Perform QC on the Mouse inner ear data, use either `Seurat` or `scater`. How different are the thresholds you used for this dataset to those you used for the Human Liver?
+
+::note
+Mouse mitochondrial genes use the pattern "^Mt-" to identify them.
+:::
+
+***Bonus Exercise***
+
+Perform QC using either `Seurat` or `scater`, on the EmptyDrops filtered Liver data, rather than the cellranger filtered data. Was it easier or harder to find a good threshold? Did you change the thresholds you used? How many cells remain?
+
+--------------------------------------------------------------------------------------------------------
+
+# Normalization 
+
+## Counts Per Million (CPM)
+
+Normalization aims to eliminate biases caused by certain cells having more total UMIs detected than others. The simplest approach is counts per million (CPM). This is performed as the default for `Seurat::NormalizeData()` and `scuttle::logNormCounts()` (for SCE objects). 
+
+Originally CPM would rescale each sample to 1 million total reads. Most single cells have total counts closer to 10,000 - which is what `Seurat` uses to rescale each sample to (However, this can vary depending on your chosen sequencing depth and sample type). In contrast, by default `scuttle` rescales each cell to the average total counts per cell for your particular sample.
+
+
+```{r}
+sce_filtered <- logNormCounts(sce_filtered)
+seur_obj_filtered <- NormalizeData(seur_obj_filtered)
+```
+We will use PCA to visualize the effect of these normalizations. Note that PCA assumes data generally follow a normal distribution, which we can mimic in our data by log transforming it. Both scuttle and Seurat will automatically log transform our data.
+
+First let's see what the data looks like prior to normalization.
+```{r}
+assay(sce_filtered, "logcounts_raw") <- log2(counts(sce_filtered) + 1)
+sce_filtered <- runPCA(sce_filtered, exprs_values = "logcounts_raw")
+plotPCA(sce_filtered, colour_by = "sum", size_by = "detected")
+```
+Here you can see the first principal component which represents 34% of the total variance in the data is driven by the total counts / total detected genes.
+
+
+```{r}
+sce_filtered <- scater::runPCA(sce_filtered)
+scater::plotPCA(sce_filtered, size_by = "detected", colour_by = "sum")
+```
+Now we see that normalization has largely removed the association of the top principal component with total UMIs.
+
+## Scran
+```{r}
+require(scran)
+```
+
+If our data has a few highly expressed genes that are also differentially expressed in our dataset, this will create biases in CPM. There are many fixes to this available for bulkRNAseq but they assume every gene is detected in every cell. To allow these methods to be used for single-cell data Lun et al. developed `scran` which pools cells together into artificial bulk RNAseq before calculating the normalization factors. Finally it deconvolves those factor back into single-cell factors.
+
+```{r}
+qclust <- quickCluster(sce_filtered, min.size = 30)
+sce_filtered <- computeSumFactors(sce_filtered, clusters = qclust)
+sce_filtered <- logNormCounts(sce_filtered)
+```
+
+We can see how that has changed our data using PCA again:
+```{r}
+sce_filtered <- runPCA(sce_filtered)
+plotPCA(sce_filtered, size_by = "detected", colour_by = "sum")
+```
+
+## Pearson Residuals
+
+Recent publications have suggested using Pearson Residuals, which are effectively Z-scores but for any type of distribution rather than specifically for a normal distribution. i.e. pr = (X - mean)/sqrt(var)
+
+We can use M3Drop to fit a Negative Binomial distribution that accounts for differences in sequencing depth to our raw UMI counts, and then calculate Pearson residuals with respect to this distribution. Because this approach accounts for the variance of the data, we do not need to log transform it.
+
+
+```{r}
+require("M3Drop") # Note Pearson residuals is only available in the github (development) version of M3Drop at present.
+fit <- NBumiFitModel(counts(sce_filtered))
+pr <- NBumiPearsonResiduals(counts(sce_filtered), fit)
+assay(sce_filtered, "pearson") <- pr
+sce_filtered <- runPCA(sce_filtered, exprs_values="pearson")
+plotPCA(sce_filtered, size_by = "detected", colour_by = "sum", ncomponents=1:2)
+```
+Here we can see that this PCA is performing poorly on the pearson residuals, this is because by default our PCA method is using the top 500 most variable genes. Usually these are among the most highly expressed genes, however when we scale with Pearson residuals very lowerly expressed genes can end up with high variances.
+
+```{r}
+mean_counts <- apply(counts(sce_filtered), 1, mean)
+pr_var <- apply(pr, 1, var)
+plot(mean_counts, pr_var, xlab="Mean UMI counts", ylab="Pearson Residual Variance")
+```
+Thus we can 'fix' our Pearson Residual PCA by telling our PCA method to use the most highly expressed genes instead.
+
+```{r}
+top_expressed_genes <- tail(sort(mean_counts), 500)
+sce_filtered <- runPCA(sce_filtered, exprs_values="pearson", subset_row = names(top_expressed_genes))
+plotPCA(sce_filtered, size_by = "detected", colour_by = "sum", ncomponents=1:2)
+```
+Now our PCA is back showing we have reduced the effect of library size.
+
+::note
+Fitting the negative binomial distribution to each gene requires much more computational effort than the previous methods.
+::::
+
+***Exercise 4***
+What is the maximum, minimum, and average normalized expression for the "ALB" gene using scran normalization vs Pearson residuals? (hint: use the "summary()" function)
+
+## SCTransform
+
+Seurat includes an alternative normalization method which directly addresses the specific issue with library size that we see in single-cell data by taking each gene and preforming a regression (assuming negative binomial noise) against total number of UMIs for each cell. 
+
+You can optionally include other meta.data features, such as mt.percent or batches. To speed up calculations Seurat groups genes together based on their overall expression level to perform this regression.
+```{r}
+require(Seurat)
+seur_obj_filtered <- SCTransform(seur_obj_filtered)
+seur_obj_filtered@assays
+DefaultAssay(seur_obj_filtered)
+```
+Here we can see that running SCTransform generates an entire new "assay" which will contain it's own counts, data, and scale.data matrices. The contents of these matrices depends on which version of Seurat you are using. For the most recent version counts are "corrected" counts, data is log transformed counts, and scale.data is pearson residual. Note that "corrected" counts are effectively imputed / smoothed values from reversing the regression model.
+
+```{r}
+par(mfrow=c(1,2))
+plot(seur_obj_filtered@meta.data$nFeature_RNA, seur_obj_filtered@meta.data$nFeature_SCT, xlab="raw ngenes", ylab="SCT ngenes")
+abline(a=0,b=1, col="red", lwd=2)
+
+plot(seur_obj_filtered@meta.data$nCount_RNA, seur_obj_filtered@meta.data$nCount_SCT, xlab="raw nUMI", ylab="SCT nUMI", log="xy")
+abline(a=0,b=1, col="red", lwd=2)
+
+```
+SCT counts are obtained by reversing the regression model while fixing the predicted variables across cells - i.e. all cells are assumed to have the same sequencing depth, thus "flattening" the spread of total UMIs across cells. However, as the correction is constrained such that a gene's expression cannot be < 0 it cannot fully "flatten" the effect of library size. In addition, as genes are binned by expression level to simplify the model fitting this can produce "jump" distortions as we see in the plot on the right.
+
+*Note: These distortions mean our data no longer fits a Negative Binomial model, thus SCT counts should not be used to replace raw counts for any method based on a negative binomial model. Indeed the SCT counts should not be used for anything, only the normalized expression values are useful.*
+
+
+```{r}
+par(mfrow=c(1,1))
+plot(seur_obj_filtered@meta.data$nCount_RNA, seur_obj_filtered@meta.data$nFeature_RNA, xlab="nUMI", ylab="nGenes", log="xy")
+points(seur_obj_filtered@meta.data$nCount_SCT, seur_obj_filtered@meta.data$nFeature_SCT, col="blue")
+
+```
+SCTransform also can distort the relationship between the total UMIs and the total genes detected.  
+
+We can look at a PCA to compare the LogNormalized vs SCT normalization. Seurat requires gene expression to be scaled to have a mean = 0 and sd = 1 prior to calculating PCA. SCT does this automatically, but for LogNormalization we need an additional step:
+
+```{r}
+seur_obj_filtered <- ScaleData(seur_obj_filtered, assay="RNA")
+```
+Unlike in scater, we also must provide Seurat with a set of genes to consider for the PCA. We can use the same ones we used for the Person residuals above, but we need change them into gene symbols for Seurat first.
+
+```{r}
+pca_genes_ensg <- names(top_expressed_genes)
+pca_genes_symbol <- rowData(sce_filtered)$Symbol[rowData(sce_filtered)$ID %in% pca_genes_ensg]
+```
+
+Now we can run PCA in Seurat.
+
+```{r}
+seur_obj_filtered <- RunPCA(seur_obj_filtered, assay="RNA", features=pca_genes_symbol)
+FeaturePlot(seur_obj_filtered, reduction="pca", features="nCount_RNA")
+```
+
+
+```{r}
+seur_obj_filtered <- RunPCA(seur_obj_filtered, assay="SCT", features=pca_genes_symbol)
+FeaturePlot(seur_obj_filtered, reduction="pca", features="nCount_RNA")
+```
+
+Here you can see the SCT has a significantly different effect compared to the other normalization approaches, and may be better for identifying cell-types.
+
+***Exercise 5***
+What is the maximum, minimum, and average normalized expression for the "ALB" gene in raw counts, lognormalized expression, SCT counts, SCT lognormalized expression, SCT pearson residuals? (hint: use the "summary()" function)
+How do these compare to the normalized values we saw for NBumi and scran above?
+
+***Bonus Exercise:***
+
+Normalize the ear dataset using one of the normalization methods above.
+
+:::note
+Another advantage to storing all our data & results into a single R object, is that it is easy to save our work and come back to it later. While you can save your entire workspace in R to pick up again later that is inefficient as many temporary variables you've forgotten about, and packages you aren't using anymore will be saved along with your data. Thus, I recommend saving just your SingleCellExperiment or Seurat Objects when you finish a significant step of your analysis to comeback to if you need to rerun or change something later.
+```{r}
+saveRDS(seur_obj_filtered, "Liver5_QC_Norm_Seurat.rds")
+```
+:::
+
+
+## Data Visualization and Dimensionality Reduction
+
+Once we have normalized and (optionally) scaled our data, we need to reduce the dimensionality of our data to remove most of the noise. First we will identify those genes that have the most signal (vs noise), then we will use PCA to combine correlated genes.
+
+### Feature Selection
+
+In Seurat, we identify "highly variable genes". Like so:
+
+```{r}
+seur_obj_filtered <- FindVariableFeatures(seur_obj_filtered)
+top10 <- head(VariableFeatures(seur_obj_filtered), 10)
+plot1 <- VariableFeaturePlot(seur_obj_filtered)
+plot1 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1
+```
+*Note: "Residual Variance" is the variance of each gene after correcting for the general relationship between mean expression and variance.*
+
+
+By default Seurat uses the top 2000 variable features, however if you have a dataset with many cell populations you may want to increase this number like so:
+```{r}
+seur_obj_filtered <- FindVariableFeatures(seur_obj_filtered, nfeatures=3000)
+```
+You can also specify a specific set of genes such as those identified from another tool, or add/remove specific genes to the set of HVGs. Adding genes can be particularly useful for finding rare cell-types as marker genes from rare cell-types can be missed. Removing genes is typically used to eliminate certain confounders, e.g. removing mitochondrial genes prevents clusters being driven by cell-quality.
+
+```{r}
+hvgs <- VariableFeatures(seur_obj_filtered)
+hvgs <- c(hvgs, "EOMES") # add a key marker of liver NK cells
+hvgs <- hvgs[!grepl("^MT-", hvgs)] # remove mitochondrial genes
+VariableFeatures(seur_obj_filtered) <- hvgs
+```
+
+If using a SingleCellExperiment object, we can use either 'M3Drop' or 'scran' to identify important genes. M3Drop uses a statistical test to ID genes with significant variation. Scran uses a different model but also provides a statistical test for significantly variable genes:
+
+```{r}
+hvg_test_m3drop <- M3Drop::NBumiFeatureSelectionCombinedDrop(fit, qval.thresh = 0.05, suppress.plot = FALSE)
+hvgs_m3drop <- hvg_test_m3drop$Gene
+length(hvgs_m3drop)
+```
+
+```{r}
+require(scran)
+hvg_model <- modelGeneVar(sce_filtered)
+
+is.hvg <- hvg_model$p.value < 0.05
+
+hvgs_scran <- rownames(hvg_model[is.hvg,])
+length(hvgs_scran)
+
+# Visualizing the fit:
+scran_fit <- metadata(hvg_model)
+plot(scran_fit$mean, scran_fit$var, xlab="Mean of log-expression",
+    ylab="Variance of log-expression")
+curve(scran_fit$trend(x), col="dodgerblue", add=TRUE, lwd=2)
+points(scran_fit$mean[is.hvg], scran_fit$var[is.hvg], pch=16, col="red")
+```
+
+***Exercise 6***
+What is the overlap in feature selected using M3Drop vs scran?
+
+***Exercise 7***
+What is the overlap in feature selected using M3Drop or scran vs Seurat? (Hint: use the rowData of the SingleCellExperiment object to change gene IDs)
+
+
+
+### PCA
+
+As above we can calculate PCAs using our HVGs.
+```{r}
+seur_obj_filtered <- RunPCA(seur_obj_filtered, assay="SCT")
+DimPlot(seur_obj_filtered, reduction="pca")
+```
+
+
+```{r}
+sce_filtered <- runPCA(sce_filtered, exprs_values="logcounts", subset_row = hvgs_scran)
+plotPCA(sce_filtered, ncomponents=1:2)
+```
+
+## tSNE
+As mentioned in the lecture PCA preserves distances but rarely provides a good visualization of all of our data in only 2 components. Thus, we instead use non-linear methods such as tSNE and UMAP. However, both of these methods work best when starting from PCA space as compressing 20 principal components into 2 dimensions is much easier than compression 10,000 dimensional gene space  into 2 dimensions.
+
+We should always set a value for the perplexity and random seed to ensure reproducibility of our plots.
+
+```{r}
+set.seed(101)
+seur_obj_filtered<-RunTSNE(seur_obj_filtered, dims=1:20, perplexity=50)
+DimPlot(seur_obj_filtered, reduction="tsne")
+```
+```{r}
+set.seed(101)
+sce_filtered <- scater::runTSNE(sce_filtered, perplexity=50, 
+    dimred="PCA", n_dimred=20)
+plotReducedDim(sce_filtered, dimred = "TSNE")
+```
+
+***Exercise 8***
+What happens when you change the perplexity used by tSNE to 5, or 100?
+
+
+###UMAP
+
+
+```{r}
+set.seed(101)
+seur_obj_filtered<-RunUMAP(seur_obj_filtered, dims=1:20)
+DimPlot(seur_obj_filtered, reduction="umap")
+```
+
+```{r}
+set.seed(101)
+sce_filtered <- scater::runUMAP(sce_filtered, dimred="PCA", n_dimred=20)
+plotReducedDim(sce_filtered, dimred = "UMAP")
+```
+
+***Exercise 9***
+What happens when you change the number of dimensions used to 5 or 10?
+
+
+
+:::note We can always check which visualizations we've already calculated (and what their names are) for our SCE and Seurat Objects like so:
+```{r}
+reducedDims(sce_filtered)
+```
+```{r}
+Seurat::Reductions(seur_obj_filtered)
+```
+:::
+
+Finally, let's save our work again
+```{r}
+saveRDS(seur_obj_filtered, "Liver5_QC_Norm_DimReduc_Seurat.rds")
+```
+
+
+### sessionInfo()
+
+<details><summary>View session info</summary>
+```{r echo=FALSE}
+sessionInfo()
+```
+</details>

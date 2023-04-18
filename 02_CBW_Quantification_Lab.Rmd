@@ -1,0 +1,251 @@
+---
+title: "CBW_Quantification_Lab"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require("DropletUtils")
+require("Seurat")
+require("Matrix")
+set.seed(101)
+```
+
+## Reading single-cell data
+
+### cellranger output
+
+You should have downloaded a directory with raw output from cellranger for a sample of human liver single-cell RNAseq. This directory contains two folders and two files:
+
+* filtered_feature_bc_matrix : UMI count matrix in sparse format for droplets cell-ranger things have cells
+* raw_feature_bc_matrix : UMI count matrix in sparse format for all droplets
+* metrics_summary.csv : summary statistics in text form
+* web_summary.html : summary statistics as a pretty html
+
+First let's open the **web_summary.html** and look inside.
+
+Cellranger actually outputs a lot of other stuff too, but these are what matter. 
+
+*Note: filtered_feature_bc_matrix.h5 is just the same data as the folder of the same name but saved into a different file format known as "hdf5" which has been optimized for Read/Write of large matrices.*
+
+If you look inside either of the folders you will see: 
+* barcodes.tsv.gz : full DNA sequence of the droplet barcode. (columns of the count matrix)
+* features.tsv.gz : one or more gene names for each gene. (rows of the count matrix)
+* matrix.mtx.gz : the count matrix in sparse data format, rows and columns are just numbers to save memory.
+
+Sparse matrices are used when data has a lot of zeros to save memory. They only store those entries in a matrix that are not 0. These are store as a triplet: (row, column, value). By loading the "Matrix" package we can load this matrix into R and work with it exactly as we would any other matrix. We will use Seurat's "Read10X" function to automatically add the row and column names for us from the appropriate text files.
+
+```{r load}
+raw_dat <- Seurat::Read10X(data.dir = "../ExampleData/Liver5/raw_feature_bc_matrix/")
+dim(raw_dat)
+```
+
+By using `dim()` we can see how big this matrix is, this is all the possible droplet barcodes. Lets look at some basic statistics:
+
+```{r rowcolsums}
+summary(rowSums(raw_dat)) # total UMI per gene
+summary(colSums(raw_dat)) # total UMI per droplet
+```
+Let's simplify our lives and save our RAM by removing droplets with 1 or fewer UMIs.
+```{r rowcolsums}
+raw_dat <- raw_dat[,colSums(raw_dat)>1]
+dim(raw_dat)
+#raw_dat <- readRDS("Liver5/smaller_raw_dat.rds")
+```
+
+## Running EmptyDrops
+
+### Knee & Inflection Point
+
+First let's try some simple ways to identify valid cells by finding the "knees" in the barcode rank plot we saw in the cellranger output.
+
+```{r barcoderank}
+br.out <- barcodeRanks(raw_dat)
+plot(br.out$rank, br.out$total, log="xy", xlab="Rank", ylab="Total")
+abline(h=metadata(br.out)$knee, col="dodgerblue", lty=2)
+abline(h=metadata(br.out)$inflection, col="forestgreen", lty=2)
+legend("bottomleft", lty=2, col=c("dodgerblue", "forestgreen"), 
+    legend=c("knee", "inflection"))
+
+```
+
+Here we can see the knee and inflection point are almost the same. Let's figure out which droplets would be considered cells using this method.
+
+```{r kneeinflect}
+is.cell.knee <- br.out$total > metadata(br.out)$knee
+sum(is.cell.knee)
+is.cell.inflect <- br.out$total > metadata(br.out)$inflection
+sum(is.cell.inflect)
+```
+
+is.cell.knee and is.cell.inflect are vectors of TRUE/FALSE values for each droplet. When we use `sum()` TRUE turns into 1 and FALSE turns into 0, so we get the number of TRUEs which in this case is the number of cells called. 
+
+### Poisson Model
+
+Now let's see what happens if we use the Poisson model to identify cells. First let's check what parameters we need `?emptyDrops`
+
+```{r poisson}
+e.out <- emptyDrops(raw_dat, lower=100, niters=10000, ignore=NULL, retain=2*br.out$knee)
+head(e.out)
+```
+
+Here we can see the output from emptyDrops including the FDR corrected pvalue, and whether the pvalue was lower than could be calculated using the give number of iterations (Limited). Let's get rid of the NAs (ambient droplets) so we can check if our number of iterations was enough.
+
+```{r itercheck}
+e.out <- e.out[!is.na(e.out$PValue),]
+head(e.out[e.out$Limited,])
+```
+
+The FDR for the limited droplets isn't that low which will skew all our other droplets as well. We could rerun emptyDrops with more iterations to get better results (I usually use niter=100000). But for now this is good enough, let's call droplets that are different from background at FDR 1% valid cells:
+
+```{r callcells}
+# Significance threshold
+is.cell <- e.out$FDR <= 0.01
+plot(e.out$Total, -e.out$LogProb, col=ifelse(is.cell, "red", "black"),
+    xlab="Total UMI count", ylab="-Log Probability", pch=18)
+sum(is.cell)
+
+```
+
+### Visualize Output
+
+Here red are those droplets we identified as cells, black are those that are ambient RNA. Lets put this onto our barcode-rank plot.
+
+```{r brplot2}
+e.cells <- rownames(e.out)[is.cell]
+plot(br.out$rank, br.out$total, log="xy", xlab="Rank", ylab="Total")
+abline(h=metadata(br.out)$knee, col="dodgerblue", lty=2)
+abline(h=metadata(br.out)$inflection, col="forestgreen", lty=2)
+legend("bottomleft", lty=2, col=c("dodgerblue", "forestgreen"), 
+    legend=c("knee", "inflection"))
+
+br.out.ecells <- br.out[rownames(br.out) %in% e.cells,]
+
+points(br.out.ecells$rank, br.out.ecells$total, col="red")
+
+```
+It's kind of hard to see what is going on because the points are on top of each other let's force them apart. Here we'll shift the "is a cell" (red) to the left and "is not a cell" (blue) to the right...
+
+```{r brplot3}
+plot(br.out$rank, br.out$total, log="xy", xlab="Rank", ylab="Total")
+abline(h=metadata(br.out)$knee, col="dodgerblue", lty=2)
+abline(h=metadata(br.out)$inflection, col="forestgreen", lty=2)
+legend("bottomleft", lty=2, col=c("dodgerblue", "forestgreen"), 
+    legend=c("knee", "inflection"))
+
+br.out.not.ecells <- br.out[!rownames(br.out) %in% e.cells,]
+
+points(br.out.ecells$rank/5, br.out.ecells$total, col="red")
+
+points(br.out.not.ecells$rank*5, br.out.not.ecells$total, col="blue")
+```
+We can check the overlap between what the emptydrops model calls a cell and what the inflection point called a cell:
+```{r}
+table(e.cells %in% rownames(br.out)[is.cell.inflect])
+```
+Lastly, let's apply our EmptyDrops filtering and save it for later.
+```{r}
+e_filtered_dat <- raw_dat[, colnames(raw_dat) %in% e.cells]
+saveRDS(e_filtered_dat, "Liver5/EmptyDrops_filtered_matrix.rds")
+```
+
+
+## Identifying Doublets (DoubletFinder)
+
+```{r}
+require(DoubletFinder)
+```
+To estimate the number of heterotypic doublets vs homotypic we need to know the number & frequencies of the different cell-types that we have observed in our dataset. Normally we would be running this as part of a larger analysis of the data and be doing many steps that we will talk about tomorrow to figure this out correctly. However, since this is for calling the threshold for what is / isn't considered a doublet we don't need to be super accurate, so we will just run the standard Seurat clustering pipeline with default parameters to get a quick estimate. We will go through these functions and how they work in detail tomorrow.
+
+```{r}
+set.seed(42)
+filter_dat <- Seurat::Read10X("../ExampleData/Liver5/filtered_feature_bc_matrix/")
+seur_obj <- Seurat::CreateSeuratObject(filter_dat, min.cells=5, min.features=100)
+seur_obj <- Seurat::NormalizeData(seur_obj)
+seur_obj <- Seurat::FindVariableFeatures(seur_obj)
+seur_obj <- Seurat::ScaleData(seur_obj)
+seur_obj <- Seurat::RunPCA(seur_obj)
+seur_obj <- Seurat::FindNeighbors(seur_obj)
+seur_obj <- Seurat::FindClusters(seur_obj)
+```
+
+These steps have added the `seurat_clusters` column to the `meta.data` table within our Seurat object. We can look at this using the `head()` function and we can count the number of cells in each of our clusters using the `table()` function.
+
+```{r}
+head(seur_obj@meta.data)
+table(seur_obj@meta.data$seurat_clusters)
+```
+
+To classify our cells using DoubletFinder requires several steps which involve several parameters:
+
+1. Creating a number of artificial doublets (parameter: pN = number of doublets as a % of the original dataset size)
+
+2. Merge them with our original data in PCA space (parameter: PCs = number of PCs to used for this space)
+
+3. For each cell, calculate the proportion of artifical doublets (pANN) that are next to this cell (parameter: pK = % of the merged dataset that is considered a "next to" this cell)
+
+4. Determine the threshold for the pANN score that corresponds to our expected number of heterotypic doubelts (parameter: nEXP = expected number of heterotypic doublets)
+
+First let's calculate nEXP using our clusters and some reference information for the expected doublet rate. We can manually calculate the probability of a doublet being homotypic, by squaring the frequencies of our cell-types and adding them together. This is also provided as a function: `DoubletFinder::modelHomotypic()`
+
+```{r}
+type.freq <- table(seur_obj@meta.data$seurat_clusters)/ncol(seur_obj)
+homotypic.prop <- sum(type.freq^2)
+```
+
+The proportion of cells we expect to be heterotypic doublets is then the frequency of all doublets multiplied by `1-homotypic.prop`. The "typical" doublet rate for 10X is ~0.9% per 1,000 cells captured (this is a general rule of thumb based on experiments using mixtures of mouse and human cells. 
+
+```{r}
+nEXP = 0.009*(ncol(seur_obj)/1000)*(1-homotypic.prop)*ncol(seur_obj)
+nEXP
+```
+
+For `pN` this doesn't matter so much, we'll used the author recommendation of 25%. For `PCs` the danger is in underestimating the number of PCs rather than overestimating, as underestimating will lose resolution for one or more cell-types while over estimating just adds a little bit of noise. We expect ~1 PC per cell-type present in our tissue, we can again use our quick clustering above as a rough estimate of the number of cell-types present : 15. We'll add a few extra to be safe, and use 18 PCs.
+```{r}
+pN=0.25
+PCs=18
+```
+
+The tricky parameter to set is `pK` fortunately the authors have provided an inbuilt method to try out a bunch of values for it and identify the "best" one. "Best" in this case is measured by the "biomodality coefficient" which is a statistic that measures how much a distribution of values looks like it has two peaks rather than one. This assumes that pANN values should be bimodal with one peak corresponding to doublets and the other to single-cells.
+
+```{r}
+sweep.out <- paramSweep_v3(seur_obj, PCs=1:PCs)
+sweep.stats <- summarizeSweep(sweep.out)
+plot(sweep.stats[,2:3])
+```
+
+Here we can see that low values of `pK` work better. We can now take a closer look just as those parameter combinations where we believe we'll get the best results. However, annoyingly the pK in our statistics is stored as a factor so to find those rows with a low pK we need to turn that factor back into a number:
+
+```{r}
+sweep.stats[as.numeric(as.character(sweep.stats[,2])) < 0.075 & sweep.stats[,3] > 0.8,]
+```
+Here we can see that we get pretty consistently good performance when `pK = 0.02` regardless of pN. And the absolute best performance with `pN=0.2, pK=0.02` so lets use those, and run DoubletFinder for real.
+
+```{r}
+pK=0.02
+pN=0.2
+seur_obj <- doubletFinder_v3(seur_obj, PCs=1:PCs, pN=pN, pK=pK, nExp=nEXP)
+head(seur_obj@meta.data)
+```
+
+Now you can see that doubletFinder has added into our meta.data table the doublet scores and its classification. We can check how many cells in each of our clusters have been classified as doublets using `table()`
+
+```{r}
+table(seur_obj@meta.data$seurat_clusters, seur_obj@meta.data$DF.classifications_0.2_0.02_429.2712)
+```
+Here you can see that cluster 3 is enriched in doublets (~30%) so maybe shouldn't be trusted. 
+
+We can also visualize this using a UMAP (this will be covered in the next lecture).
+
+```{r}
+seur_obj <- RunUMAP(seur_obj, dims=1:18)
+DimPlot(seur_obj, reduction="umap", group.by="DF.classifications_0.2_0.02_429.2712")
+```
+Or as a barplot:
+
+```{r}
+tab <- table(seur_obj@meta.data$seurat_clusters, seur_obj@meta.data$DF.classifications_0.2_0.02_429.2712)
+barplot(t(tab/rowSums(tab)), ylab="% of cells", xlab="Cluster")
+```
+
+In general, it is better to visualize per-cluster measures as a barplot rather than as a UMAP or tSNE because individual cells will be plotted on top of each other in the UMAP and the order of plotting determines which colour you actually see, which can result in misleading figures.

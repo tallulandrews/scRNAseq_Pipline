@@ -1,0 +1,272 @@
+---
+title: "CBW_BiologicalAnalysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Preprocessing
+
+Before we do any clustering, we need to perform QC, Normalization, and Dimensionality Reduction (HVGs + PCA). We already covered these steps for the Liver dataset, so we'll simply load that object from when we saved it:
+
+```{r}
+seur_obj <- readRDS("Liver5_QC_Norm_DimReduc_Seurat.rds")
+```
+
+Recall: to make our analysis reproducible we need to set the random seed.
+```{r}
+set.seed(4242)
+```
+
+
+# Clustering
+
+Once we've done those step it's time to cluster our data. The most common approach used for single-cell data is "Louvain" or "Leiden" clustering, which is used by Seurat and scanpy. These methods are just two different algorithms for optimizing the modularity score of clusters in a graph. Thus we first need to turn our single-cell data into a graph before we can use these algorithms.
+
+## Cell-cell graph
+
+To turn our data into a graph we will link together cells with weighted edges based on their number of shared nearest neighbours. Do do this we need to choose a number of nearest neighbours to consider (k). By default Seurat uses k=20, which seems to work well on human and mouse data sets with ~2,000-10,000 cells.
+
+```{r}
+seur_obj <- FindNeighbors(seur_obj, k.param = 20)
+```
+The NN/SNN graph is stored within the Seurat object in the "graphs" slot.
+```{r}
+seur_obj@graphs$SCT_snn[1:5,1:5]
+```
+
+:::note
+Seurat uses an approximation heuristic to calculate nearest neighbours in a faster & more scalable way but does not have guaranteed accuracy thus it's advisable to use k >= 10. For small data sets (i.e. < 750 cells) we recommend using other clustering methods such as SC3
+:::
+
+
+## Clustering
+
+Now we can run the Louvain/Leiden clustering algorithm on our cell-cell graph. Note that this is a stochastic algorithm meaning each time it is run we can get a slightly different solution. By default Seurat runs 10 iterations of the algorithm and keeps the solution with the highest modularity which improves the stability of the solution. In addition, there is a crucial resolution parameter `resolution` which influences the size of the cluster the algorithm will find. By defaul resolution is set at 0.8.
+
+```{r}
+seur_obj<-FindClusters(seur_obj, resolution=0.8)
+DimPlot(seur_obj, label=TRUE)
+```
+Here you can see that by default when we plot out data using `DimPlot` Seurat plots a UMAP coloured by the most recent set of clusters you have generated. Here we set `label=TRUE` so that the name of the cluster is plotted on the UMAP since it can be hard to distinguish colours when we have many clusters.
+
+*Note: Seurat always numbers clusters in order of number of cells from most cells to least cells.*
+
+
+We can find these cluster labels for each cell in our metadata table. 
+```{r}
+head(seur_obj@meta.data)
+```
+
+We can use `table()` to see how many cells are in each cluster.
+
+```{r}
+table(seur_obj@meta.data$SCT_snn_res.0.8)
+```
+The `seurat_clusters` column holds the most recent clusters, but all clusters you generate for a particular object will be stored in columns labelled with the assay, graph and resolution you used. Let's check this by clustering at a different resolution.
+
+```{r}
+seur_obj<-FindClusters(seur_obj, resolution=0.5)
+head(seur_obj@meta.data)
+DimPlot(seur_obj)
+```
+
+Note that the "k" of the snn is not recorded in the name of these columns, so if we want to explore the effect of different "k" we'll need save the clustering results in a column with our own name.
+
+```{r}
+seur_obj@meta.data$SCT_k20_res0.8 <- seur_obj@meta.data$SCT_snn_res.0.8
+```
+
+**Exercise 1**
+Cluster these data with resolution = 0.2, 0.5, 1, 1.5, or 2. How many clusters do you get at different resolutions?
+
+**Exercise 2**
+Cluster these data using resolution 0.8 and k=10, 20, 50. How many clusters do you get with different ks?
+
+
+## Finding optimal clusters
+
+Once we have a bunch of different clusterings at different resolutions we want to find the "best" one. We will show you three ways to compare your clusterings to make an informed decision on what parameters to use: the silhouette index, adjusted Rand index, and marker genes.
+
+### Silhouette Index
+
+For the Silhouette Index we need a matrix of all pair-wise distances between cells. We will use the same PCA dimensions as we used for clustering to calculate these distances. Plus, we need a set of clusters. We will get a score for each cell for how close it is to its cluster vs other clusters (high = distinct clusters, low = overlapping clusters), we can aggregate these scores across each cluster or across the entire clustering.
+
+```{r}
+require(cluster) # contains silhouette function.
+dist.matrix <- dist(x = Embeddings(object = seur_obj[["pca"]])[, 1:20])
+sil <- silhouette(as.numeric(as.character(seur_obj@meta.data$SCT_k20_res0.8)), dist=dist.matrix)
+head(sil)
+mean(sil[,3])
+```
+Overall we have a silhouette score of 0.29 for this set of clusters. The Silhouette score depends on a lot of factors so it is difficult to interpret the magnitude of the score in isolation, but positive silhouette scores are generally "good" and negative scores are "bad".
+
+```{r}
+cluster_sil_scores <- aggregate(sil[,3], by=list(sil[,1]), mean)
+cluster_sil_scores
+```
+Here we can see that most of the clusters have silhouette scores > 0 except for cluster 1. This means that when we go to annotate our clusters we may want to merge cluster 1 with one of its neighbouring clusters, or that we may want to change the clustering resolution.
+
+**Exercise 3**
+Using the silhouette score what is the best clustering out of those you have calculated?
+
+### Adjusted Rand Index
+
+We can also look at how stable our clusters are across different clustering parameters. We usually assume that clusters that stay the same across different resolutions are more likely to represent real cell-types than those that change. We can use the Adjusted Rand Index (ARI) to measure how similar two sets of clusters are. Identical clusters will get ARI = 1, random cluster labels will get ARI = 0, generally ARI > 0.8 is considered "good".
+
+```{r}
+require(igraph) # package containing ARI function
+ARI <- compare(seur_obj@meta.data$SCT_snn_res.0.8, seur_obj@meta.data$SCT_snn_res.0.5, method="adjusted.rand")
+ARI
+```
+
+**Exercise 4**
+Calculate ARI between your sets of clusters, which are the most similar?
+
+### Marker Genes
+
+Lastly, we can look at the number of significant marker genes we see for our clusters. Note that by default Seurat uses several arguments to increase the speed of calculation, however these violate the assumptions of p-value calculations. This is designed for quickly annotating your cluster not for validating that your clusters are good. Fortunately, we can change these arguments to make it suitable for evaluating our clustering.
+
+*Note: We use `max.cells.per.ident` here to speed up calculations, this is not necessary in the ordinary use of this approach*
+
+```{r}
+markers <- FindAllMarkers(seur_obj, group.by="SCT_snn_res.0.8", logfc.threshold = -Inf, only.pos=TRUE, max.cells.per.ident=100)
+markers <- markers[ markers[,"p_val_adj"] < 0.05, ]
+table(markers$cluster)
+```
+Similar to our silhouette results, you can see that cluster #1 is poorly defined vs the other clusters.
+
+:::note
+Seurat's marker gene tool does not account for biases due to the nature of clustering which means these DE gene results should be considered as over estimates of the true number of DE genes. And this overestimate will be greater for smaller clusters than larger ones. See: DOI: 10.1016/j.cels.2019.07.012 for accurate marker gene identification after clustering accounting for these biases.
+:::
+
+## Annotating Clusters
+
+### Marker-based Annotation
+Once we have chosen our best clustering we need to annotate each of our clusters. The most common way to do this is to examine the top marker genes for each cluster and search various databases or the literature to determine which cell-type they most likely represent. We can check the top marker genes for each of our clusters from the results above like so:
+
+```{r}
+head(markers[markers$cluster == "0",], 20)
+```
+Then we can look them up in CellMarker 2.0 to see what cell-type this might be.
+
+**CellMarker Instructions:**
+1. Go to: http://117.50.127.228/CellMarker/ 
+2. Click "Cell Tools"
+3. Select "Cell annotation"
+4. Type marker genes into the Input box separated by just a "," e.g. "IL32,CD3D,CD2"
+5. Set Species to "Human" (optional set Tissue to "Liver")
+6. Press "Submit"
+
+
+You should be able to find that this cluster would be annotated as some kind of  "T cell". 
+
+Let's save the marker genes we used to come up with this annotation and the annotation itself so we can plot them later.
+
+```{r}
+nclusters <- length(unique(seur_obj@meta.data$SCT_snn_res.0.8))
+
+# Create a vector where the names of the vector are the cluster number
+# and the values of the vector are the annotated names.
+cluster_annotation <- rep("unannotated", nclusters)
+names(cluster_annotation) <- levels(seur_obj@meta.data$SCT_snn_res.0.8)
+
+# Fill in the annotation for the first cluster
+cluster_annotation["0"] <- "T cell"
+
+# Save the genes we used for annotation
+anno_genes <- list("cluster0"=c("CD3D","CD3G", "TRAC", "CCL5", "GZMK", "RUNX3"))
+```
+
+**Exercise 5**
+Annotate the remaining clusters using CellMarker.
+
+
+Once all the clusters have been annotated we can rename our clusters in our seurat object:
+```{r}
+seur_obj = SetIdent(seur_obj, value=seur_obj@meta.data$SCT_snn_res.0.8)
+seur_obj = RenameIdents(seur_obj, cluster_annotation)
+seur_obj@meta.data$manual_anno <- Idents(seur_obj)
+head(seur_obj@meta.data)
+```
+
+We can visualize our marker gene annotation using a DotPlot:
+
+```{r}
+DotPlot(seur_obj, features=unique(unlist(anno_genes)))
+```
+
+
+**Exercise 6**
+How many of your marker genes were shared between multiple clusters?
+
+## Reference based annotation
+
+There are many tools to compare single-cell data to a reference but here we'll cover the most simple approach which is simply looking at correlations between the average gene expression in your clusters vs the average gene expression from a reference dataset.
+
+First let's load our reference dataset:
+```{r}
+ref <- readRDS("../ExampleData/MacParlandLiverAtlas_celltype_profiles.rds")
+head(ref)
+```
+
+Next we calculate the average expression of each gene in each of our clusters.
+```{r}
+query = AverageExpression(seur_obj, group.by = "SCT_snn_res.0.8", assays="RNA") # we use RNA b/c our reference was not normalized using SCT.
+head(query$RNA)
+```
+Now we need to select a subset of genes that are biologically relevant (i.e. HVGs) and are present in both datasets, and ensure both the reference and our data are subset to just those genes and the genes are in the same order.
+```{r}
+genes = VariableFeatures(seur_obj);
+genes = genes[genes %in% rownames(ref)]
+
+query2 = query$RNA[match(genes, rownames(query$RNA)),]
+ref2 = ref[match(genes, rownames(ref)),]
+identical(rownames(ref2), rownames(query2))
+```
+Now we can correlate them with each other.
+```{r}
+cross_cors = cor(query2, ref2)
+heatmap(cross_cors, scale="none", margins = c(12,4))
+```
+Using these correlations we can quickly annotate most of our clusters to at least a general cell-type.
+
+```{r}
+# Create a vector where the names of the vector are the cluster number
+# and the values of the vector are the annotated names.
+cluster_annotation2 <- rep("unannotated", nclusters)
+names(cluster_annotation2) <- levels(seur_obj@meta.data$SCT_snn_res.0.8)
+cluster_annotation2["0"] = "T cell"
+cluster_annotation2["1"] = "T cell"
+cluster_annotation2["2"] = "T cell"
+cluster_annotation2["3"] = "InfMac"
+cluster_annotation2["4"] = "NK cell"
+cluster_annotation2["5"] = "gdT cell"
+cluster_annotation2["6"] = "CD3T cell"
+cluster_annotation2["7"] = "B/T cell"
+cluster_annotation2["8"] = "B cell"
+cluster_annotation2["9"] = "Endothelial"
+cluster_annotation2["10"] = "Macrophage"
+cluster_annotation2["11"] = "Hepatocyte"
+cluster_annotation2["12"] = "AntiB"
+cluster_annotation2["13"] = "cvLSEC"
+cluster_annotation2["14"] = "Erythroid"
+cluster_annotation2["15"] = "Cholangio"
+
+seur_obj = SetIdent(seur_obj, value=seur_obj@meta.data$SCT_snn_res.0.8)
+seur_obj = RenameIdents(seur_obj, cluster_annotation2)
+seur_obj@meta.data$ref_anno <- Idents(seur_obj)
+head(seur_obj@meta.data)
+```
+
+
+**Exercise 7**
+How many genes did we use for our correlations?
+
+
+**Exercise 8**
+How do your manual annotations compare to the annotations you got from using the reference data?
+
+

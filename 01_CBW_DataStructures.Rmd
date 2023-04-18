@@ -1,0 +1,304 @@
+---
+output: html_document
+---
+
+# scRNA-seq Analysis: datastructures
+
+```{r Intro0, echo=FALSE}
+library(knitr)
+opts_chunk$set(cache = TRUE, fig.align = "center", echo=TRUE)
+require(Seurat)
+require(DropletUtils)
+require(SingleCellExperiment)
+```
+
+:::highlight
+
+## Basic R Datastructures
+
+There are four basic data structures used in R:
+- vector : a 1D ordered set of 1 or more values that are all the same type
+- matrix : a 2D grid of values that are all the same type
+- data.frame : a 2D grid of values where each column can store data of a different type.
+- list : a 1D ordered set of 1 or more values where each value can be a different type.
+
+```{r}
+x = c(1,-5,2,10,7) # vector of numbers
+x[2]
+y = c("canadian", "bioinformatics", "workshop", "single", "cell") # vector of strings
+y[1]
+```
+We can combine the vectors above into a matrix.
+```{r}
+mat1 = cbind(x,x)
+mat1
+```
+However, if we try to mix data-types R will "coerce" them into the same type. In this case strings, as you can see from the quotation marks that are now around the numbers.
+```{r}
+mat2 = rbind(x,y)
+mat2
+```
+To properly store numbers and text together we want a data.frame:
+```{r}
+df = data.frame(num=x, text=y)
+df
+```
+
+If we want to store matrices, dataframes, and vectors together we can use a list:
+```{r}
+lt = list(mat=mat2, vec=x, df=df)
+lt
+```
+
+**R "Objects"**
+Single-cell RNAseq data involves many different data structures for different parts of the data. Metadata is generally a dataframe. Gene expression is stored as a matrix. Lower dimensional projections are paired matrices, and cell-cell graphs require special datastructures.
+
+We could combine these together using a list but a list is so flexible when we give a list to a function it can be hard to find the right data in it. e.g. is the normalized data called "norm", "lognorm", "normdata", "expr_mat" etc... To solve this problem we use "Objects" that act like a list but with pre-defined slots for specific types of data.
+
+
+## Common Components of Single-cell Data
+Single cell data & analysis uses several distinct types of information, each of which can be stored in different ways:
+- genes x cells gene expression (numbers), this can be raw counts or after one or two levels of normalization
+- metadata about cells (numbers, text), this often involves various categorical classifications of cells, e.g. processing batch, patient ID, disease status, but can also involve various quality control information.
+- lower dimension representation (numbers), this includes a cells x dimensions matrix for each representation, and may include a genes x dimensions matrix
+
+Different single-cell packages use certain objects to organize these data, so functions can always find what they need.
+
+
+# Example Data
+
+Single cells isolated from the stria vascularis (SV) from the inner ear of lab mice (Korrapati et al. 2019). 
+Technology: 10X Chromium
+Database: Gene Expression Omnibus [GEO accession GSE136196](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE136196). 
+Preprocessing: cellranger(7.1.0) 
+
+## The `SingleCellExperiment` Object (SCE)
+
+We have data from a 10X experiment as a **sparse matrix**, where the data is stored as a triplet (row, column, value), so that only non-zero values are stored. Since our matrix 98% zero, this greatly reduces the amount of information we need to store!
+
+Since one letter require the same amount of space to store as any number, the text portion of the matrix (row and column names) are stored once separately in `features.tsv.gz` and `barcodes.tsv.gz`. While the triplets are stored in `matrix.mtx` as (row number, column number, umi count).
+
+We could use `Matrix::readMM()` to read in `matrix.mtx` and `read.delim()` to read in the text files and then put them together, but many packages provide a function to automatically do this for us already.
+
+To make a `SingleCellExperiment` object automatically:
+
+```{r}
+sce <- DropletUtils::read10xCounts("../ExampleData/Korrapati_MouseEar_Cells1/filtered_feature_bc_matrix/")
+sce
+```
+
+To make a `SingleCellExperiment` object manually:
+```{r}
+sparsematrix <- Matrix::readMM("../ExampleData/Korrapati_MouseEar_Cells1/filtered_feature_bc_matrix/matrix.mtx.gz")
+my_rownames <- read.delim("../ExampleData/Korrapati_MouseEar_Cells1/filtered_feature_bc_matrix/features.tsv.gz", header=F)
+my_colnames <- read.delim("../ExampleData/Korrapati_MouseEar_Cells1/filtered_feature_bc_matrix/barcodes.tsv.gz", header=F)
+head(my_rownames)
+```
+We need to pick which gene IDs we'll use, we will stick with Ensembl IDs for now.
+
+```{r}
+rownames(sparsematrix) <- my_rownames[,1]
+colnames(sparsematrix) <- my_colnames[,1]
+class(sparsematrix)
+dim(sparsematrix)
+sce2 <- SingleCellExperiment(
+  assays = list(counts = sparsematrix),
+  rowData = my_rownames
+)
+sce2
+```
+
+Here we can see we have:
+- 36601 genes (rows)
+- 475 cells (columns)
+- 1 assay called "counts"
+- no lower dimensional representations
+- DropletUtils has automatically added information about each cell that is the "Sample" and "Barcode" which we don't have when we made it automatically.
+
+
+Let's check what DropletUtils did:
+```{r}
+head(colData(sce), 10)
+```
+Here we retrieve the column data (cells) from the SCE using `colData()` then print the top 10 rows using `head()`. We can see that "Barcode" has stored the cell barcode and "Sample" has stored the path to the folder we read in. This is a bit messy to look at so let's replace that with a shorter name for this sample.
+
+```{r}
+colData(sce)$Sample <- "Korrapati_exons"
+head(colData(sce))
+```
+*How many rows did `head()` print by default?* 
+
+If we look at the structure of our sce in the Environment browser or using `str()` we can see all the different slots in our SCE object. 
+
+:::
+**Exercise 1**
+Using the following "accessor" functions obtain the following information from the SCE object:
+
+1) the gene symbol of the 1013th row.
+2) the expression level for the 19108th gene in the 271th cell.
+3) the cellbarcodes of the first 25 cells.
+
+| Function | Description |
+| -: | :- |
+| `rowData(sce)` | Table of gene metadata. |
+| `colData(sce)` | Table of cell metadata. |
+| `assay(sce, "counts")` | The assay named "counts". |
+| `reducedDim(sce, "PCA")` | The reduced dimensionality table named "PCA" |
+| `sce$colname` | Shortcut to access the colum "colname" from `colData`. This is equivalent to `colData(sce)$colname` |
+| `sce[<rows>, <columns>]` | We can use the square brackets to subset the SCE object by rows or columns, similarly to how we subset `matrix` or `data.frame` objects |
+:::
+
+
+:::note
+**Naming Assays**
+
+Assays can have any name we wish. 
+However, there are some  conventions we can follow:
+
+- `counts`: Raw count data, e.g. number of reads or transcripts for a particular gene.
+- `normcounts`: Normalized values on the same scale as the original counts. For example, counts divided by cell-specific size factors that are centred at unity.
+- `logcounts`: Log-transformed counts or count-like values. In most cases, this will be defined as log-transformed normcounts, e.g. using log base 2 and a pseudo-count of 1.
+- `cpm`: Counts-per-million. This is the read count for each gene in each cell, divided by the library size of each cell in millions.
+- `tpm`: Transcripts-per-million. This is the number of transcripts for each gene in each cell, divided by the total number of transcripts in that cell (in millions).
+:::
+
+Each of these has a function, so that we can access the "counts" assay using the `counts()` function.
+Therefore, these two are equivalent:
+
+```{r, eval=FALSE}
+counts(sce)
+assay(sce, "counts")
+```
+
+While this is simply conventions, many packages we use will assume the assay names above and you may get errors if your assays are incorrectly named. Fortunately, many functions will automatically create the appropriately named assay.
+
+## The `Seurat` Object
+
+The other commonly used software package for 10X Chromium data is `Seurat`. Like with SingleCellExperiment there are some provided functions to make it easier to read data from cellranger.
+
+```{r}
+sparsematrix <- Seurat::Read10X("../ExampleData/Korrapati_MouseEar_Cells1/filtered_feature_bc_matrix/")
+seur_obj <- Seurat::CreateSeuratObject(sparsematrix)
+seur_obj
+```
+Seurat has expanded its data object in order to store multi-modal data : e.g. RNA & ATACseq. So here we can see we have one assay called "RNA", and we will have to look inside of "RNA" to find the count matrix and the normalized matrix (once we generate one).
+
+```{r}
+Seurat::GetAssayData(seur_obj, assay="RNA", "counts")[1:5,1:5]
+seur_obj@assays$RNA@counts[1:5,1:5]
+```
+If we look at the structure of the Seurat Object as before, we can see that we have 3 slots for assays within out "RNA" slot: 
+- "counts" : raw umi counts
+- "data" : normalized gene expression
+- "scale.data" : scaling each row of "data" to have a mean of 0 and standard deviation of 1
+
+We also don't have `rowData` or `colData`, instead Seurat puts information about the cells into `meta.data` and doesn't store gene information at all - it uses gene symbols by default. 
+
+Seurat also automatically calculates some quality measures for us and puts them in the metadata. Let's have a look:
+
+```{r}
+head(seur_obj@meta.data)
+```
+
+Here we see the total UMI counts for each cell ("nCount_RNA") and the number of different genes detected per cell ("nFeature_RNA"). As with DropletUtils, Seurat has automatically added a sample id `orig.ident` but this time it's even less helpful. 
+
+:::note
+**Exercise 2**
+Fix the sample ID in the metadata of our Seurat Object.
+
+:::
+
+Rather than fix the sample ID afterwards, we can set it when we create the Seurat Object:
+
+```{r}
+seur_obj <- Seurat::CreateSeuratObject(sparsematrix, project="Korrapati_exons")
+```
+
+## Modifying Objects
+We've already seen that we can modify parts of the metadata. We can use a similar approach to modify all parts of an object. However, each slot has specific requirements that must be fulfilled to assign a new value. You can use `class()` to help figure out what is required. These are to ensure the appropriate data is present in each slot so that other functions that use the object can run correctly.
+
+:::note
+**Exercise 3**
+Manually read in the `introns.mtx` matrix. It contains counts for the number of intronic reads only for our data. The replace the counts in our `seur_obj` with the intronic counts.
+:::
+
+
+## Some more useful functions
+
+
+| Function | Description |
+| -: | :- |
+| `rowMeans(sparsematrix)` | mean of each row. |
+| `colMeans(sparsematrix)` | mean of each column. |
+| `rowSums(sparsematrix)` | sum of each row. |
+| `colSums(sparsematrix)` | sum of each column. |
+| `t()` | swaps rows and columns of a matrix. |
+
+Let's use these functions to calculate the same summary statistics we have in our SeuratObject for our SingleCellExperiment object.
+
+```{r}
+colData(sce)$nCount <- colSums(counts(sce))
+colData(sce)$nFeatures <- colSums(counts(sce) > 0) 
+```
+
+:::note
+When we do math with TRUE/FALSE values, the are swapped to numbers: TRUE = 1, FALSE = 0.
+:::
+
+
+
+### Subsetting SCE Objects
+
+Similarly to the standard `data.frame` and `matrix` objects in R, we can use the `[` operator to subset our SingleCellExperiment or SeuratObject either by _rows_ (genes) or _columns_ (cells). 
+The general syntax is: **`sce[rows_of_interest, columns_of_interest]`**. We can use gene/column names, logical values, or row/column numbers.
+
+For example, we might want to select only the cells with >1000 detected genes:
+```{r}
+filtered_sce <- sce[,colData(sce)$nCount > 1000]
+dim(filtered_sce)
+```
+Or we may want to remove mitochondrial genes from the matrix:
+```{r}
+filtered_sce <- sce[!grepl("^MT-", rownames(sce)),]
+dim(filtered_sc)
+```
+
+:::note
+`grepl("^MT-")` uses a regular expression to find all the genes that start with ("^"), a particular pattern ("MT-"). It returns TRUE if the rownames matches the pattern and FALSE if it doesn't. The details of all the options for regular expressions is beyond the scope of this course but use `?grepl` to see the related R functions and see this website for more information on regular expressions: [Intro to Regular Expressions](https://cran.r-project.org/web/packages/stringr/vignettes/regular-expressions.html)
+:::
+
+
+---------------------------------------------------------------
+
+
+## Overview
+
+:::highlight
+**KEY POINTS**
+
+- The **_SingleCellExperiment_** (SCE) object is used to store expression data as well as information about our **cells (columns)** and **genes (rows)**. 
+- To create a new SCE object we can use the `SingleCellExperiment()` function. To read the output from _cellranger_ we can use the dedicated function `DropletUtils::read10xCounts()`. 
+- The main parts of this object are:
+  - **_assay_** - one or more matrices of expression quantification.
+      - There is one essential assay named "counts", which contains the raw counts on which all other analyses are based on.
+  - **_rowData_** - information about our genes.
+  - **_colData_** - information about our cells.
+  - **_reducedDim_** - one or more reduced dimensionality representations of our data.
+- We can access all the parts of this object using functions of the same name. For example `assay(sce, "counts")` retrieves the counts matrix from the object. 
+- We can add/modify parts of this object using the assignment operator `<-`. For example `assay(sce, "logcounts") <- log2(counts(sce) + 1)` would add a new assay named "logcounts" to our object. 
+- Matrix summary metrics are very useful to explore the properties of our expression data. Some of the more useful functions include `rowSums()`/`colSums()` and `rowMeans()`/`colMeans()`. These can be used to summarise information from our assays, for example `colSums(counts(sce))` would give us the total counts in each cell (columns). 
+- Combining matrix summaries with conditional operators (`>`, `<`, `==`, `!=`) can be used for **conditional subsetting** using `[`. 
+- Seurat objects function much the same way, but there is no rowData and colData in stored in the @meta.data slot. We can also have multiple different types of data within the same Seurat Object, whereas SingleCellExperiment is only suitable for one type of data at a time.
+
+:::
+
+
+### sessionInfo()
+
+<details><summary>View session info</summary>
+```{r echo=FALSE}
+sessionInfo()
+```
+</details>
+
+

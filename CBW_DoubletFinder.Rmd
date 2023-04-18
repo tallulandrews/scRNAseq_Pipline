@@ -1,0 +1,100 @@
+---
+title: "CBW_DoubletFinder"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Identifying Doublets (DoubletFinder)
+
+```{r}
+require(DoubletFinder)
+```
+To estimate the number of heterotypic doublets vs homotypic we need to know the number & frequencies of the different cell-types that we have observed in our dataset. Normally we would be running this as part of a larger analysis of the data and be doing many steps that we will talk about tomorrow to figure this out correctly. However, since this is for calling the threshold for what is / isn't considered a doublet we don't need to be super accurate, so we will just run the standard Seurat clustering pipeline with default parameters to get a quick estimate. We will go through these functions and how they work in detail tomorrow.
+
+```{r}
+set.seed(42)
+filter_dat <- Seurat::Read10X("Liver5/filtered_feature_bc_matrix")
+seur_obj <- Seurat::CreateSeuratObject(filter_dat, min.cells=5, min.features=100)
+seur_obj <- Seurat::NormalizeData(seur_obj)
+seur_obj <- Seurat::FindVariableFeatures(seur_obj)
+seur_obj <- Seurat::ScaleData(seur_obj)
+seur_obj <- Seurat::RunPCA(seur_obj)
+seur_obj <- Seurat::FindNeighbors(seur_obj)
+seur_obj <- Seurat::FindClusters(seur_obj)
+```
+
+These steps have added the `seurat_clusters` column to the `meta.data` table within our Seurat object. We can look at this using the `head()` function and we can count the number of cells in each of our clusters using the `table()` function.
+
+```{r}
+head(seur_obj@meta.data)
+table(seur_obj@meta.data$seurat_clusters)
+```
+
+To classify our cells using DoubletFinder requires several steps which involve several parameters:
+
+1. Creating a number of artificial doublets (parameter: pN = number of doublets as a % of the original dataset size)
+
+2. Merge them with our original data in PCA space (parameter: PCs = number of PCs to used for this space)
+
+3. For each cell, calculate the proportion of artifical doublets (pANN) that are next to this cell (parameter: pK = % of the merged dataset that is considered a "next to" this cell)
+
+4. Determine the threshold for the pANN score that corresponds to our expected number of heterotypic doubelts (parameter: nEXP = expected number of heterotypic doublets)
+
+First let's calculate nEXP using our clusters and some reference information for the expected doublet rate. We can manually calculate the probability of a doublet being homotypic, by squaring the frequencies of our cell-types and adding them together. This is also provided as a function: `DoubletFinder::modelHomotypic()`
+
+```{r}
+type.freq <- table(seur_obj@meta.data$seurat_clusters)/ncol(seur_obj)
+homotypic.prop <- sum(type.freq^2)
+```
+
+The proportion of cells we expect to be heterotypic doublets is then the frequency of all doublets multiplied by `1-homotypic.prop`. The "typical" doublet rate for 10X is ~0.9% per 1,000 cells captured (this is a general rule of thumb based on experiments using mixtures of mouse and human cells. 
+
+```{r}
+nEXP = 0.009*(ncol(seur_obj)/1000)*(1-homotypic.prop)*ncol(seur_obj)
+nEXP
+```
+
+For `pN` this doesn't matter so much, we'll used the author recommendation of 25%. For `PCs` the danger is in underestimating the number of PCs rather than overestimating, as underestimating will lose resolution for one or more cell-types while over estimating just adds a little bit of noise. We expect ~1 PC per cell-type present in our tissue, we can again use our quick clustering above as a rough estimate of the number of cell-types present : 15. We'll add a few extra to be safe, and use 18 PCs.
+```{r}
+pN=0.25
+PCs=18
+```
+
+The tricky parameter to set is `pK` fortunately the authors have provided an inbuilt method to try out a bunch of values for it and identify the "best" one. "Best" in this case is measured by the "biomodality coefficient" which is a statistic that measures how much a distribution of values looks like it has two peaks rather than one. This assumes that pANN values should be bimodal with one peak corresponding to doublets and the other to single-cells.
+
+```{r}
+sweep.out <- paramSweep_v3(seur_obj, PCs=1:PCs)
+sweep.stats <- summarizeSweep(sweep.out)
+plot(sweep.stats[,2:3])
+```
+
+Here we can see that low values of `pK` work better. We can now take a closer look just as those parameter combinations where we believe we'll get the best results. However, annoyingly the pK in our statistics is stored as a factor so to find those rows with a low pK we need to turn that factor back into a number:
+
+```{r}
+sweep.stats[as.numeric(as.character(sweep.stats[,2])) < 0.075 & sweep.stats[,3] > 0.8,]
+```
+Here we can see that we get pretty consistently good performance when `pK = 0.02` regardless of pN. And the absolute best performance with `pN=0.2, pK=0.02` so lets use those, and run DoubletFinder for real.
+
+```{r}
+pK=0.02
+pN=0.2
+seur_obj <- doubletFinder_v3(seur_obj, PCs=1:PCs, pN=pN, pK=pK, nExp=nEXP)
+head(seur_obj@meta.data)
+```
+
+Now you can see that doubletFinder has added into our meta.data table the doublet scores and its classification. We can check how many cells in each of our clusters have been classified as doublets using `table()`
+
+```{r}
+table(seur_obj@meta.data$seurat_clusters, seur_obj@meta.data$DF.classifications_0.2_0.02_429.2712)
+```
+Here you can see that cluster 3 is enriched in doublets (~30%) so probably shouldn't be trusted. 
+
+We can also visualize this using a UMAP (this will be covered in the next lecture).
+
+```{r}
+seur_obj <- RunUMAP(seur_obj, dims=1:18)
+DimPlot(seur_obj, reduction="umap", group.by="DF.classifications_0.2_0.02_429.2712")
+```
